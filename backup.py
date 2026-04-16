@@ -934,33 +934,48 @@ def run_migrate_folders(cfg: configparser.ConfigParser) -> None:
                 "UPDATE folders SET name = ? WHERE id = ?",
                 (new_name, folder_id),
             )
-            # eml_path: replace only the leading prefix
+            # Use REPLACE() instead of SUBSTR() so that paths already
+            # containing new_prefix (e.g. set by --repair) are left
+            # untouched while paths still using old_prefix are updated.
             store._db.execute(
-                "UPDATE emails SET eml_path = ? || SUBSTR(eml_path, ?) "
+                "UPDATE emails SET eml_path = REPLACE(eml_path, ?, ?) "
                 "WHERE folder_id = ?",
-                (new_email_prefix, len(old_email_prefix) + 1, folder_id),
+                (old_email_prefix, new_email_prefix, folder_id),
             )
-            # file_path for attachments of emails in this folder
             store._db.execute(
-                "UPDATE attachments "
-                "SET file_path = ? || SUBSTR(file_path, ?) "
+                "UPDATE attachments SET file_path = REPLACE(file_path, ?, ?) "
                 "WHERE email_id IN (SELECT id FROM emails WHERE folder_id = ?)",
-                (new_att_prefix, len(old_att_prefix) + 1, folder_id),
+                (old_att_prefix, new_att_prefix, folder_id),
             )
 
-            # ── 2. Rename directories ─────────────────────────────────
+            # ── 2. Move / rename directories ──────────────────────────
             for old_p, new_p in ((old_emails_dir, new_emails_dir),
                                   (old_att_dir,    new_att_dir)):
                 if not old_p.exists():
-                    continue                          # nothing on disk yet
-                if new_p.exists():
-                    raise RuntimeError(
-                        f"Target directory already exists: {new_p}\n"
-                        "If a partial migration left this behind, remove it "
-                        "manually and re-run --migrate-folders."
-                    )
-                old_p.rename(new_p)
-                renamed_dirs.append((new_p, old_p))  # remember for rollback
+                    # Source gone: either already renamed or never created.
+                    log.info("  Source dir not found, skipping rename: %s", old_p)
+                    continue
+                if not new_p.exists():
+                    # Simple rename — nothing in the way.
+                    old_p.rename(new_p)
+                    renamed_dirs.append((new_p, old_p))
+                else:
+                    # Target already exists (e.g. --repair created it).
+                    # Merge: move every UID sub-directory from old to new.
+                    log.info("  Target exists, merging %s → %s", old_p.name, new_p.name)
+                    moved_items: List[tuple] = []
+                    for item in sorted(old_p.iterdir()):
+                        dest = new_p / item.name
+                        if dest.exists():
+                            raise RuntimeError(
+                                f"Merge conflict: {dest} already exists in both "
+                                f"source and target. Remove one manually and re-run."
+                            )
+                        item.rename(dest)
+                        moved_items.append((dest, item))
+                    old_p.rmdir()
+                    # For rollback: record the individual item moves
+                    renamed_dirs.append((new_p, old_p, moved_items))
 
             store._db.execute("COMMIT")
             total_renamed += 1
@@ -972,12 +987,23 @@ def run_migrate_folders(cfg: configparser.ConfigParser) -> None:
                 store._db.execute("ROLLBACK")
             except Exception:
                 pass
-            # Undo directory renames in reverse order
-            for new_p, old_p in reversed(renamed_dirs):
+            # Undo directory moves in reverse order
+            for entry in reversed(renamed_dirs):
+                new_p, old_p = entry[0], entry[1]
+                moved_items  = entry[2] if len(entry) > 2 else None
                 try:
-                    new_p.rename(old_p)
+                    if moved_items is not None:
+                        # Reverse the individual item moves, then restore dir
+                        for dest, src in reversed(moved_items):
+                            try:
+                                dest.rename(src)
+                            except Exception as e3:
+                                log.error("  Could not undo item move %s: %s", dest, e3)
+                        old_p.mkdir(exist_ok=True)
+                    else:
+                        new_p.rename(old_p)
                 except Exception as e2:
-                    log.error("  Could not undo rename %s → %s: %s", new_p, old_p, e2)
+                    log.error("  Could not undo dir move %s → %s: %s", new_p, old_p, e2)
             total_failed += 1
 
     store.close()
