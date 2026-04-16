@@ -79,9 +79,12 @@ def create_app(data_dir: str) -> Flask:
         db.execute("PRAGMA foreign_keys=ON")
         return db
 
-    # ------------------------------------------------------------------
-    # Routes
-    # ------------------------------------------------------------------
+    # Ensure bookmarks / tags tables exist before any request touches them.
+    # _ensure_user_tables is idempotent (uses CREATE TABLE IF NOT EXISTS).
+    with app.app_context():
+        _db = get_db()
+        _ensure_user_tables(_db)
+        _db.close()
 
     @app.route("/")
     def index():
