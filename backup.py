@@ -374,6 +374,84 @@ class EmailStore:
 
         self._db.commit()
 
+    def index_existing_eml(
+        self,
+        folder_name: str,
+        folder_id: int,
+        uid: int,
+        eml_path: Path,
+    ) -> None:
+        """Re-index a .eml file that already exists on disk.
+
+        Identical to save_email except it does NOT write the .eml file;
+        it uses the supplied eml_path as-is and stores that path in the DB.
+        Used by --repair to recover emails that failed during a previous run.
+        """
+        if self.email_exists(folder_id, uid):
+            return
+
+        raw_bytes = eml_path.read_bytes()
+        msg = email.message_from_bytes(raw_bytes, policy=email.policy.compat32)
+
+        subject   = _decode_header_value(msg.get("Subject", ""))
+        sender    = _decode_header_value(msg.get("From", ""))
+        to_raw    = msg.get("To", "")
+        cc_raw    = msg.get("Cc", "")
+        recipients = "; ".join(
+            filter(None, [_decode_header_value(to_raw), _decode_header_value(cc_raw)])
+        )
+        message_id   = msg.get("Message-ID", "").strip()
+        date_sent    = _parse_date(msg.get("Date", ""))
+        date_received = datetime.now(timezone.utc).isoformat()
+
+        body_plain, body_html, attachments = _extract_parts(msg)
+        has_attachments = 1 if attachments else 0
+        body_text = body_plain or _html_to_text(body_html) or ""
+
+        cur = self._db.execute(
+            """
+            INSERT OR IGNORE INTO emails
+                (folder_id, uid, message_id, subject, sender, recipients,
+                 date_sent, date_received, has_attachments, eml_path)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                folder_id, uid, message_id, subject, sender, recipients,
+                date_sent, date_received, has_attachments,
+                str(eml_path.relative_to(self.data_dir)),
+            ),
+        )
+        email_id = cur.lastrowid
+        if email_id is None or email_id == 0:
+            return
+
+        self._db.execute(
+            "INSERT OR IGNORE INTO emails_body(rowid, body_text) VALUES(?,?)",
+            (email_id, body_text),
+        )
+
+        # Save attachments alongside the eml (use _safe_path for the folder dir)
+        for filename, ctype, payload in attachments:
+            att_dir = self.attachments_dir / _safe_path(folder_name) / str(uid)
+            _makedirs(att_dir)
+            safe_name = _safe_filename(filename)
+            att_path2 = att_dir / safe_name
+            counter = 1
+            while att_path2.exists():
+                stem, suffix = os.path.splitext(safe_name)
+                att_path2 = att_dir / f"{stem}_{counter}{suffix}"
+                counter += 1
+            with _open_for_write(att_path2) as f:
+                f.write(payload)
+            self._db.execute(
+                """INSERT INTO attachments(email_id, filename, content_type, size, file_path)
+                   VALUES(?,?,?,?,?)""",
+                (email_id, filename, ctype, len(payload),
+                 str(att_path2.relative_to(self.data_dir))),
+            )
+
+        self._db.commit()
+
     def close(self) -> None:
         self._db.close()
 
@@ -555,7 +633,14 @@ def _safe_filename(name: str, max_len: int = 80) -> str:
     return stem[:keep] + ext
 
 
-def _open_for_write(path: Path) -> "open":
+def _safe_path_legacy(folder_name: str) -> str:
+    """Original safe_path behaviour (no UTF-7 decoding, no length cap).
+    Used only by run_repair to match directory names created by older versions
+    of this script that did not decode IMAP modified UTF-7."""
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", folder_name)
+
+
+
     """Open a file for binary writing, using the \\\\?\\ prefix on Windows
     to bypass the 260-character MAX_PATH limit."""
     if sys.platform == "win32":
@@ -661,6 +746,92 @@ def run_backup(
 
 
 # ---------------------------------------------------------------------------
+# Repair mode  (no IMAP needed)
+# ---------------------------------------------------------------------------
+
+def run_repair(cfg: configparser.ConfigParser) -> None:
+    """Re-index every .eml file on disk that has no matching SQLite record.
+
+    This recovers emails that were written to disk but whose SQLite commit was
+    never reached (e.g. due to a long-path error or an unknown charset error on
+    a previous run).  No IMAP connection is required — everything is local.
+
+    Algorithm
+    ---------
+    1. Read the folders table from the DB.
+    2. For each folder, compute two candidate directory names:
+         • new-style: _safe_path(name)          e.g. "Doručené zprávy 16-22"
+         • legacy:    _safe_path_legacy(name)   e.g. "Doru&AQ0-en&AOk-..."
+       Both are tried so that backups created with the old code are handled.
+    3. Scan every *.eml file in those directories.
+    4. If the (folder_id, uid) pair is absent from the emails table, call
+       index_existing_eml() to parse and insert it.
+    """
+    data_dir = cfg.get("backup", "data_dir", fallback="data")
+    store = EmailStore(data_dir)
+    emails_dir = Path(data_dir) / "emails"
+
+    if not emails_dir.exists():
+        log.error("Emails directory not found: %s", emails_dir)
+        store.close()
+        return
+
+    # Build mapping:  directory_name (str) → (folder_id, folder_name)
+    dir_to_folder: dict = {}
+    rows = store._db.execute("SELECT id, name FROM folders").fetchall()
+    for row in rows:
+        fid, fname = row["id"], row["name"]
+        dir_to_folder[_safe_path(fname)]        = (fid, fname)
+        dir_to_folder[_safe_path_legacy(fname)] = (fid, fname)
+
+    total_found = total_repaired = total_failed = 0
+
+    for folder_dir in sorted(emails_dir.iterdir()):
+        if not folder_dir.is_dir():
+            continue
+
+        entry = dir_to_folder.get(folder_dir.name)
+        if entry is None:
+            log.warning("Directory '%s' does not match any known folder — skipping.",
+                        folder_dir.name)
+            continue
+
+        folder_id, folder_name = entry
+
+        # Find .eml files with no DB record
+        orphans = [
+            p for p in sorted(folder_dir.glob("*.eml"), key=lambda p: int(p.stem))
+            if p.stem.isdigit() and not store.email_exists(folder_id, int(p.stem))
+        ]
+
+        if not orphans:
+            log.info("Folder '%s': all emails already indexed.", folder_name)
+            continue
+
+        log.info("Folder '%s': found %d un-indexed .eml file(s) — re-indexing …",
+                 folder_name, len(orphans))
+        total_found += len(orphans)
+
+        for eml_file in orphans:
+            uid = int(eml_file.stem)
+            try:
+                store.index_existing_eml(folder_name, folder_id, uid, eml_file)
+                total_repaired += 1
+                log.info("  Repaired UID %d", uid)
+            except Exception as exc:
+                total_failed += 1
+                log.error("  Failed to re-index UID %d: %s", uid, exc)
+
+    store.close()
+    log.info(
+        "Repair complete: %d found, %d re-indexed, %d still failed.",
+        total_found, total_repaired, total_failed,
+    )
+    if total_failed:
+        log.warning("Check backup.log for details on the %d remaining failures.", total_failed)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -679,10 +850,22 @@ def main() -> None:
         default=None,
         help="Only backup a specific folder (exact IMAP name)",
     )
+    parser.add_argument(
+        "--repair",
+        action="store_true",
+        help=(
+            "Re-index .eml files on disk that have no SQLite record "
+            "(recovers emails that failed on a previous run). "
+            "Does NOT connect to IMAP."
+        ),
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    run_backup(cfg, full_backup=args.full, only_folder=args.folder)
+    if args.repair:
+        run_repair(cfg)
+    else:
+        run_backup(cfg, full_backup=args.full, only_folder=args.folder)
 
 
 if __name__ == "__main__":
