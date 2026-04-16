@@ -1,0 +1,18 @@
+# ─────────────────────────────────────────
+# Horde Email Backup — Python dependencies
+# ─────────────────────────────────────────
+# Install:  pip install -r requirements.txt
+# Python 3.9+ required
+
+# backup.py uses only the stdlib (imaplib, email, sqlite3, ssl …)
+# No extra dependencies needed for the backup script.
+
+# explorer/app.py
+flask>=3.0,<4.0
+
+# Optional: improves HTML sanitization beyond the built-in regex approach.
+# Uncomment if you want to use bleach instead of the built-in sanitizer.
+# bleach>=6.0,<7.0
+
+# PyInstaller for Windows packaging (install separately, not in venv):
+# pip install pyinstaller
