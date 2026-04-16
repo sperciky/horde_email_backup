@@ -98,7 +98,11 @@ class IMAPClient:
             self._conn = None
 
     def list_folders(self) -> List[str]:
-        """Return a list of decoded folder names."""
+        """Return decoded (Unicode) folder names.
+
+        The IMAP LIST response uses modified UTF-7; we decode it here so
+        every other part of the code works with plain Unicode strings.
+        """
         typ, data = self._conn.list()
         if typ != "OK":
             raise RuntimeError("LIST command failed")
@@ -111,14 +115,18 @@ class IMAPClient:
             # Parse: (\HasNoChildren) "/" "INBOX"
             m = re.match(r'\(.*?\)\s+"?([^"]+)"?\s+"?([^"]+)"?$', item.strip())
             if m:
-                sep = m.group(1).strip('"')
                 name = m.group(2).strip('"')
-                folders.append(name)
+                folders.append(_decode_imap_utf7(name))
         return folders
 
     def select_folder(self, folder: str) -> int:
-        """Select a folder and return the message count."""
-        typ, data = self._conn.select(f'"{folder}"', readonly=True)
+        """Select a folder (Unicode name) and return the message count.
+
+        Re-encodes the Unicode name to IMAP modified UTF-7 before sending
+        the SELECT command, because IMAP servers require the wire format.
+        """
+        imap_name = _encode_imap_utf7(folder)
+        typ, data = self._conn.select(f'"{imap_name}"', readonly=True)
         if typ != "OK":
             raise RuntimeError(f"SELECT failed for folder '{folder}': {data}")
         return int(data[0])
@@ -568,6 +576,36 @@ def _decode_imap_utf7(s: str) -> str:
     return "".join(result)
 
 
+def _encode_imap_utf7(s: str) -> str:
+    """Encode a Unicode folder name back to IMAP modified UTF-7 (RFC 3501).
+
+    Required when passing a decoded folder name to IMAP SELECT / EXAMINE,
+    because the server only understands the UTF-7 wire format.
+    """
+    result: list = []
+    buf: list = []   # accumulates non-ASCII chars between flushes
+
+    def _flush() -> None:
+        if not buf:
+            return
+        utf16 = "".join(buf).encode("utf-16-be")
+        b64 = base64.b64encode(utf16).decode("ascii").replace("/", ",").rstrip("=")
+        result.append("&" + b64 + "-")
+        buf.clear()
+
+    for ch in s:
+        if ch == "&":
+            _flush()
+            result.append("&-")
+        elif 0x20 <= ord(ch) <= 0x7E:   # printable ASCII (except &)
+            _flush()
+            result.append(ch)
+        else:
+            buf.append(ch)
+    _flush()
+    return "".join(result)
+
+
 # Maps non-standard charset labels (as seen in real-world email) to Python codec names.
 _CHARSET_ALIASES: dict = {
     "cp-850": "cp850",
@@ -832,6 +870,126 @@ def run_repair(cfg: configparser.ConfigParser) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Folder name migration  (one-time, no IMAP needed)
+# ---------------------------------------------------------------------------
+
+def run_migrate_folders(cfg: configparser.ConfigParser) -> None:
+    """Rename IMAP-UTF-7-encoded folder names to proper Unicode — everywhere.
+
+    Touches three things for each folder whose name contains &…- sequences:
+
+    1. ``folders.name``          — the display name stored in the DB
+    2. ``emails.eml_path``       — the relative path to every .eml file
+    3. ``attachments.file_path`` — the relative path to every attachment
+    4. The actual directories on disk (emails/ and attachments/)
+
+    Everything for one folder is wrapped in a single SQLite transaction.
+    If anything fails the DB changes are rolled back and the directory is
+    renamed back, so the archive is never left in an inconsistent state.
+
+    Safe to run multiple times (already-migrated folders are skipped).
+    """
+    data_dir = Path(cfg.get("backup", "data_dir", fallback="data")).resolve()
+    store = EmailStore(data_dir)
+
+    rows = store._db.execute("SELECT id, name FROM folders ORDER BY name").fetchall()
+    total_renamed = total_skipped = total_failed = 0
+
+    for row in rows:
+        folder_id  = row["id"]
+        old_name   = row["name"]
+        new_name   = _decode_imap_utf7(old_name)
+
+        if old_name == new_name:
+            log.info("Folder '%s': already in Unicode, skipping.", old_name)
+            total_skipped += 1
+            continue
+
+        log.info("Migrating '%s'  →  '%s'", old_name, new_name)
+
+        # ── directory names ─────────────────────────────────────────
+        old_dir = _safe_path_legacy(old_name)   # as created by old code
+        new_dir = _safe_path(new_name)           # target (decoded + capped)
+
+        old_emails_dir = data_dir / "emails"      / old_dir
+        new_emails_dir = data_dir / "emails"      / new_dir
+        old_att_dir    = data_dir / "attachments" / old_dir
+        new_att_dir    = data_dir / "attachments" / new_dir
+
+        # ── path prefixes stored in the DB (OS path separator) ──────
+        # Use str(Path(…)) so the separator matches what Python stored.
+        sep = os.sep
+        old_email_prefix = "emails"      + sep + old_dir
+        new_email_prefix = "emails"      + sep + new_dir
+        old_att_prefix   = "attachments" + sep + old_dir
+        new_att_prefix   = "attachments" + sep + new_dir
+
+        renamed_dirs: List[tuple] = []   # (new_path, old_path) for rollback
+
+        try:
+            # ── 1. DB transaction ────────────────────────────────────
+            store._db.execute("BEGIN")
+
+            store._db.execute(
+                "UPDATE folders SET name = ? WHERE id = ?",
+                (new_name, folder_id),
+            )
+            # eml_path: replace only the leading prefix
+            store._db.execute(
+                "UPDATE emails SET eml_path = ? || SUBSTR(eml_path, ?) "
+                "WHERE folder_id = ?",
+                (new_email_prefix, len(old_email_prefix) + 1, folder_id),
+            )
+            # file_path for attachments of emails in this folder
+            store._db.execute(
+                "UPDATE attachments "
+                "SET file_path = ? || SUBSTR(file_path, ?) "
+                "WHERE email_id IN (SELECT id FROM emails WHERE folder_id = ?)",
+                (new_att_prefix, len(old_att_prefix) + 1, folder_id),
+            )
+
+            # ── 2. Rename directories ─────────────────────────────────
+            for old_p, new_p in ((old_emails_dir, new_emails_dir),
+                                  (old_att_dir,    new_att_dir)):
+                if not old_p.exists():
+                    continue                          # nothing on disk yet
+                if new_p.exists():
+                    raise RuntimeError(
+                        f"Target directory already exists: {new_p}\n"
+                        "If a partial migration left this behind, remove it "
+                        "manually and re-run --migrate-folders."
+                    )
+                old_p.rename(new_p)
+                renamed_dirs.append((new_p, old_p))  # remember for rollback
+
+            store._db.execute("COMMIT")
+            total_renamed += 1
+            log.info("  Done.")
+
+        except Exception as exc:
+            log.error("  FAILED: %s — rolling back.", exc)
+            try:
+                store._db.execute("ROLLBACK")
+            except Exception:
+                pass
+            # Undo directory renames in reverse order
+            for new_p, old_p in reversed(renamed_dirs):
+                try:
+                    new_p.rename(old_p)
+                except Exception as e2:
+                    log.error("  Could not undo rename %s → %s: %s", new_p, old_p, e2)
+            total_failed += 1
+
+    store.close()
+    log.info(
+        "Migration complete: %d renamed, %d already clean, %d failed.",
+        total_renamed, total_skipped, total_failed,
+    )
+    if total_failed:
+        log.error("Some folders could not be migrated — check backup.log.")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -859,11 +1017,23 @@ def main() -> None:
             "Does NOT connect to IMAP."
         ),
     )
+    parser.add_argument(
+        "--migrate-folders",
+        action="store_true",
+        help=(
+            "One-time migration: decode IMAP UTF-7 folder names to proper "
+            "Unicode in the DB and on disk (e.g. 'Doru&AQ0-en...' → "
+            "'Doručené zprávy'). Updates all eml_path / file_path references "
+            "atomically. Safe to re-run. Does NOT connect to IMAP."
+        ),
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     if args.repair:
         run_repair(cfg)
+    elif args.migrate_folders:
+        run_migrate_folders(cfg)
     else:
         run_backup(cfg, full_backup=args.full, only_folder=args.folder)
 
