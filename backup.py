@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import base64
 import configparser
 import email
 import email.policy
@@ -298,9 +299,10 @@ class EmailStore:
         """Parse and persist a raw email."""
         # Write .eml file
         folder_email_dir = self.emails_dir / _safe_path(folder_name)
-        folder_email_dir.mkdir(parents=True, exist_ok=True)
+        _makedirs(folder_email_dir)
         eml_path = folder_email_dir / f"{uid}.eml"
-        eml_path.write_bytes(raw_bytes)
+        with _open_for_write(eml_path) as f:
+            f.write(raw_bytes)
 
         # Parse
         msg = email.message_from_bytes(raw_bytes, policy=email.policy.compat32)
@@ -347,7 +349,7 @@ class EmailStore:
         # Save attachments
         for filename, ctype, payload in attachments:
             att_dir = self.attachments_dir / _safe_path(folder_name) / str(uid)
-            att_dir.mkdir(parents=True, exist_ok=True)
+            _makedirs(att_dir)
             safe_name = _safe_filename(filename)
             att_path = att_dir / safe_name
             # Avoid collisions
@@ -356,7 +358,8 @@ class EmailStore:
                 stem, suffix = os.path.splitext(safe_name)
                 att_path = att_dir / f"{stem}_{counter}{suffix}"
                 counter += 1
-            att_path.write_bytes(payload)
+            with _open_for_write(att_path) as f:
+                f.write(payload)
             self._db.execute(
                 """INSERT INTO attachments(email_id, filename, content_type, size, file_path)
                    VALUES(?,?,?,?,?)""",
@@ -424,13 +427,13 @@ def _extract_parts(
         if ctype == "text/plain" and not filename:
             payload = part.get_payload(decode=True)
             if payload:
-                charset = part.get_content_charset() or "utf-8"
+                charset = _normalize_charset(part.get_content_charset())
                 body_plain_parts.append(payload.decode(charset, errors="replace"))
 
         elif ctype == "text/html" and not filename:
             payload = part.get_payload(decode=True)
             if payload:
-                charset = part.get_content_charset() or "utf-8"
+                charset = _normalize_charset(part.get_content_charset())
                 body_html_parts.append(payload.decode(charset, errors="replace"))
 
     return (
@@ -456,16 +459,119 @@ def _html_to_text(html: str) -> str:
     return text.strip()
 
 
+def _decode_imap_utf7(s: str) -> str:
+    """Decode IMAP modified UTF-7 (RFC 3501) folder name to Unicode.
+
+    IMAP encodes non-ASCII folder names as &<modified-base64>-.
+    ',' is used instead of '/' in the base64 alphabet.
+    '&-' is a literal '&'.
+    """
+    result = []
+    i = 0
+    while i < len(s):
+        if s[i] == "&":
+            j = s.find("-", i + 1)
+            if j == -1:
+                result.append(s[i:])
+                break
+            if j == i + 1:
+                result.append("&")
+            else:
+                b64 = s[i + 1 : j].replace(",", "/")
+                b64 += "=" * ((-len(b64)) % 4)
+                try:
+                    result.append(base64.b64decode(b64).decode("utf-16-be"))
+                except Exception:
+                    result.append(s[i : j + 1])
+            i = j + 1
+        else:
+            result.append(s[i])
+            i += 1
+    return "".join(result)
+
+
+# Maps non-standard charset labels (as seen in real-world email) to Python codec names.
+_CHARSET_ALIASES: dict = {
+    "cp-850": "cp850",
+    "cp-852": "cp852",
+    "cp-1250": "cp1250",
+    "cp-1251": "cp1251",
+    "cp-1252": "cp1252",
+    "cp-1253": "cp1253",
+    "cp-1254": "cp1254",
+    "cp-1256": "cp1256",
+    "x-mac-cyrillic": "mac_cyrillic",
+    "x-mac-roman": "mac_roman",
+    "x-mac-ce": "mac_latin2",
+    "x-sjis": "shift_jis",
+    "x-euc-jp": "euc_jp",
+    "238": "cp1250",   # Windows Eastern European codepage number
+    "204": "cp1251",   # Windows Cyrillic
+    "161": "cp1253",   # Windows Greek
+    "162": "cp1254",   # Windows Turkish
+    "177": "cp1255",   # Windows Hebrew
+    "178": "cp1256",   # Windows Arabic
+    "850": "cp850",
+    "437": "cp437",
+    "1250": "cp1250",
+    "1251": "cp1251",
+    "1252": "cp1252",
+    "1253": "cp1253",
+}
+
+
+def _normalize_charset(charset: Optional[str]) -> str:
+    """Return a Python-recognised codec name for any charset label."""
+    if not charset:
+        return "utf-8"
+    key = charset.lower().strip()
+    return _CHARSET_ALIASES.get(key, key)
+
+
 def _safe_path(folder_name: str) -> str:
-    """Convert an IMAP folder name to a safe filesystem path segment."""
-    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", folder_name)
+    """Convert an IMAP folder name to a safe, short filesystem path segment.
+
+    First decodes IMAP modified UTF-7 so Czech/Cyrillic etc. folders get
+    their real Unicode names rather than the encoded &AOk-... form.
+    Then strips characters illegal on Windows and caps length at 60 chars.
+    """
+    decoded = _decode_imap_utf7(folder_name)
+    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", decoded)
+    return safe[:60]
 
 
-def _safe_filename(name: str) -> str:
-    """Sanitize a filename from an email attachment."""
+def _safe_filename(name: str, max_len: int = 80) -> str:
+    """Sanitize an attachment filename and cap its length.
+
+    max_len=80 leaves ample room within Windows MAX_PATH even for deeply
+    nested backup paths.  The file extension is always preserved.
+    """
     name = os.path.basename(name) or "attachment"
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
-    return name[:200]  # truncate very long names
+    if len(name) <= max_len:
+        return name
+    stem, ext = os.path.splitext(name)
+    keep = max_len - len(ext)
+    return stem[:keep] + ext
+
+
+def _open_for_write(path: Path) -> "open":
+    """Open a file for binary writing, using the \\\\?\\ prefix on Windows
+    to bypass the 260-character MAX_PATH limit."""
+    if sys.platform == "win32":
+        path_str = "\\\\?\\" + str(path.resolve())
+    else:
+        path_str = str(path)
+    return open(path_str, "wb")
+
+
+def _makedirs(path: Path) -> None:
+    """Create directories, using the \\\\?\\ prefix on Windows."""
+    if sys.platform == "win32":
+        path_str = "\\\\?\\" + str(path.resolve())
+        os.makedirs(path_str, exist_ok=True)
+    else:
+        path.mkdir(parents=True, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
