@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Horde Email Explorer</title>
+  <link rel="stylesheet" href="/static/style.css"/>
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════════════════════ SIDEBAR -->
+<aside id="sidebar">
+  <div id="sidebar-header">
+    <span class="logo">&#9993; Mail Explorer</span>
+    <button id="theme-toggle" title="Toggle dark mode">&#9790;</button>
+  </div>
+
+  <!-- Search -->
+  <div id="search-box">
+    <input type="search" id="search-input" placeholder="Search all mail…" autocomplete="off"/>
+    <button id="search-btn" title="Search">&#128269;</button>
+  </div>
+
+  <!-- Stats bar -->
+  <div id="stats-bar">Loading…</div>
+
+  <!-- Folder tree -->
+  <nav id="folder-tree">
+    <div class="folder-section-title">FOLDERS</div>
+    <ul id="folder-list"></ul>
+    <div class="folder-section-title" style="margin-top:12px">VIEWS</div>
+    <ul>
+      <li class="folder-item" data-view="bookmarks">
+        <span class="folder-icon">&#9733;</span> Bookmarks
+      </li>
+    </ul>
+  </nav>
+</aside>
+
+<!-- ═══════════════════════════════════════════════════════ EMAIL LIST -->
+<section id="list-panel">
+  <!-- Filter bar -->
+  <div id="filter-bar">
+    <input type="text" id="filter-sender"    placeholder="From…"    class="filter-input"/>
+    <input type="text" id="filter-recipient" placeholder="To…"      class="filter-input"/>
+    <input type="text" id="filter-subject"   placeholder="Subject…" class="filter-input"/>
+    <input type="date" id="filter-date-from" class="filter-input" title="From date"/>
+    <input type="date" id="filter-date-to"   class="filter-input" title="To date"/>
+    <label class="filter-check">
+      <input type="checkbox" id="filter-attachments"/> Has att.
+    </label>
+    <button id="filter-apply">Filter</button>
+    <button id="filter-clear">&#10005;</button>
+    <span id="sort-bar">
+      Sort:
+      <select id="sort-field">
+        <option value="date_sent">Date</option>
+        <option value="sender">Sender</option>
+        <option value="subject">Subject</option>
+      </select>
+      <select id="sort-order">
+        <option value="desc">Newest first</option>
+        <option value="asc">Oldest first</option>
+      </select>
+    </span>
+  </div>
+
+  <!-- Email list -->
+  <div id="email-list-container">
+    <ul id="email-list"></ul>
+    <div id="list-status"></div>
+  </div>
+
+  <!-- Pagination -->
+  <div id="pagination">
+    <button id="page-prev" disabled>&#8592; Prev</button>
+    <span id="page-info"></span>
+    <button id="page-next" disabled>Next &#8594;</button>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════ EMAIL VIEW -->
+<section id="view-panel">
+  <div id="view-placeholder">
+    <span>&#9993;</span><br/>Select an email to read it
+  </div>
+
+  <div id="view-content" style="display:none">
+    <!-- Header -->
+    <div id="view-header">
+      <div id="view-actions">
+        <button id="btn-bookmark" title="Bookmark">&#9733;</button>
+        <button id="btn-download-eml" title="Download .eml">&#8615; EML</button>
+        <button id="btn-download-txt" title="Export plain text">&#8615; TXT</button>
+        <button id="btn-view-plain" title="Switch to plain text">Plain</button>
+        <button id="btn-view-html"  title="Switch to HTML">HTML</button>
+      </div>
+      <h2 id="view-subject"></h2>
+      <table id="view-meta">
+        <tr><td>From</td><td id="view-from"></td></tr>
+        <tr><td>To</td>  <td id="view-to"></td></tr>
+        <tr><td>Date</td><td id="view-date"></td></tr>
+        <tr><td>Folder</td><td id="view-folder"></td></tr>
+      </table>
+
+      <!-- Tags -->
+      <div id="tag-area">
+        <span id="tag-list"></span>
+        <input type="text" id="tag-input" placeholder="Add tag…" maxlength="40"/>
+        <button id="tag-add-btn">+</button>
+      </div>
+
+      <!-- Attachments -->
+      <div id="attachments-area" style="display:none">
+        <strong>Attachments:</strong>
+        <ul id="attachments-list"></ul>
+      </div>
+    </div>
+
+    <!-- Body -->
+    <div id="view-body">
+      <iframe id="body-iframe" sandbox="allow-same-origin" title="Email body"></iframe>
+      <pre   id="body-plain"  style="display:none"></pre>
+    </div>
+  </div>
+</section>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

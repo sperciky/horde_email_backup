@@ -2,6 +2,18 @@
 merge_claude.py
 config_git_claude_repo.json
 
+# Local config with credentials — never commit
+config.ini
+
+# Backup data directory (can be large)
+data/
+
+# PyInstaller build artefacts
+*.spec
+
+# Logs
+*.log
+
 # Python
 __pycache__/
 *.py[cod]
