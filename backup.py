@@ -678,7 +678,7 @@ def _safe_path_legacy(folder_name: str) -> str:
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", folder_name)
 
 
-
+def _open_for_write(path: Path) -> "open":
     """Open a file for binary writing, using the \\\\?\\ prefix on Windows
     to bypass the 260-character MAX_PATH limit."""
     if sys.platform == "win32":
