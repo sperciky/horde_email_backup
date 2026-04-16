@@ -206,50 +206,68 @@ def create_app(data_dir: str) -> Flask:
             return jsonify({"total": 0, "page": page, "per_page": per_page, "emails": []})
 
         db = get_db()
-        # Escape FTS special chars, then add prefix wildcard for each token
         fts_query = _build_fts_query(q)
 
+        # NOTE: snippet() crashes when the FTS content table (emails_body) has
+        # fewer columns than the FTS virtual table.  We exclude snippet() from
+        # the SQL and generate a plain-text excerpt in Python instead.
         folder_cond = "AND e.folder_id = ?" if folder_id else ""
         extra_params = [folder_id] if folder_id else []
 
-        count_row = db.execute(
-            f"""
-            SELECT COUNT(*) AS n
-            FROM emails_fts fts
-            JOIN emails e ON e.id = fts.rowid
-            WHERE emails_fts MATCH ?
-            {folder_cond}
-            """,
-            [fts_query] + extra_params,
-        ).fetchone()
-        total = count_row["n"]
+        try:
+            count_row = db.execute(
+                f"""
+                SELECT COUNT(*) AS n
+                FROM emails_fts
+                JOIN emails e ON e.id = emails_fts.rowid
+                WHERE emails_fts MATCH ?
+                {folder_cond}
+                """,
+                [fts_query] + extra_params,
+            ).fetchone()
+            total = count_row["n"]
 
-        offset = (page - 1) * per_page
-        rows = db.execute(
-            f"""
-            SELECT e.id, e.uid, e.subject, e.sender, e.recipients,
-                   e.date_sent, e.has_attachments,
-                   f.name AS folder_name,
-                   snippet(emails_fts, 3, '<mark>', '</mark>', '…', 20) AS snippet
-            FROM emails_fts fts
-            JOIN emails e ON e.id = fts.rowid
-            JOIN folders f ON f.id = e.folder_id
-            WHERE emails_fts MATCH ?
-            {folder_cond}
-            ORDER BY rank
-            LIMIT ? OFFSET ?
-            """,
-            [fts_query] + extra_params + [per_page, offset],
-        ).fetchall()
+            offset = (page - 1) * per_page
+            rows = db.execute(
+                f"""
+                SELECT e.id, e.uid, e.subject, e.sender, e.recipients,
+                       e.date_sent, e.has_attachments,
+                       f.name AS folder_name
+                FROM emails_fts
+                JOIN emails e ON e.id = emails_fts.rowid
+                JOIN folders f ON f.id = e.folder_id
+                WHERE emails_fts MATCH ?
+                {folder_cond}
+                ORDER BY emails_fts.rank
+                LIMIT ? OFFSET ?
+                """,
+                [fts_query] + extra_params + [per_page, offset],
+            ).fetchall()
+        except Exception as exc:
+            db.close()
+            return jsonify({"error": str(exc)}), 500
+
+        # Build plain-text excerpts in Python (avoids the snippet() crash)
+        keywords = [t.strip('"').rstrip('*') for t in fts_query.split(' AND ')]
+        results = []
+        for r in rows:
+            d = dict(r)
+            body_row = db.execute(
+                "SELECT body_text FROM emails_body WHERE rowid = ?", (d["id"],)
+            ).fetchone()
+            d["snippet"] = _make_excerpt(
+                body_row["body_text"] if body_row else "", keywords
+            )
+            results.append(d)
+
         db.close()
-
         return jsonify(
             {
                 "total": total,
                 "page": page,
                 "per_page": per_page,
                 "query": q,
-                "emails": [dict(r) for r in rows],
+                "emails": results,
             }
         )
 
@@ -543,13 +561,40 @@ def _ensure_user_tables(db: sqlite3.Connection) -> None:
 
 def _build_fts_query(raw: str) -> str:
     """Convert a plain search string to an FTS5 MATCH expression."""
-    # Remove FTS5 special chars to avoid parse errors
     cleaned = re.sub(r'[^\w\s@.\-]', ' ', raw)
     tokens = cleaned.split()
     if not tokens:
         return '""'
-    # Prefix match on each token for live-search feel
     return " AND ".join(f'"{t}"*' for t in tokens)
+
+
+def _make_excerpt(text: str, keywords: List[str], radius: int = 120) -> str:
+    """Return a short plain-text excerpt around the first keyword hit.
+
+    Wraps matched terms in <mark>…</mark> for the frontend to display.
+    Falls back to the first `radius*2` characters if no keyword is found.
+    """
+    if not text:
+        return ""
+    lower = text.lower()
+    best = len(text)
+    for kw in keywords:
+        pos = lower.find(kw.lower())
+        if 0 <= pos < best:
+            best = pos
+    start = max(0, best - radius // 2)
+    end   = min(len(text), start + radius * 2)
+    excerpt = ("…" if start else "") + text[start:end] + ("…" if end < len(text) else "")
+    # Highlight each keyword (case-insensitive)
+    for kw in keywords:
+        if not kw:
+            continue
+        excerpt = re.sub(
+            rf'(?i)({re.escape(kw)})',
+            r'<mark>\1</mark>',
+            excerpt,
+        )
+    return excerpt
 
 
 _TAG_WHITELIST = {
